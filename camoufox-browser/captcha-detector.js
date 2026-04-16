@@ -351,22 +351,27 @@ async function runDomScan(page) {
       }
     });
 
-    // 5. Turnstile response input (hidden input created by Turnstile after solving)
-    const turnstileInput = document.querySelector('input[name="cf-turnstile-response"]') ||
-                           document.querySelector('[name*="turnstile"]');
-    if (turnstileInput && results.every(r => r.type !== 'turnstile')) {
-      // Turnstile is present but we haven't detected it via other methods
-      const form = turnstileInput.closest('form');
-      let sitekey = '';
-      if (form) {
-        const widget = form.querySelector('.cf-turnstile') || form.querySelector('[data-sitekey]');
-        if (widget) sitekey = widget.getAttribute('data-sitekey') || '';
+    // 5. Turnstile response input (hidden input — last resort only)
+    // Only use this if NO Turnstile was detected via widget/iframe/script (signals 1-4)
+    const hasTurnstileAlready = results.some(r => r.type === 'turnstile' && r.sitekey);
+    if (!hasTurnstileAlready) {
+      const turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
+      if (turnstileInput && results.every(r => r.type !== 'turnstile')) {
+        const form = turnstileInput.closest('form');
+        let sitekey = '';
+        if (form) {
+          const widget = form.querySelector('.cf-turnstile') || form.querySelector('[data-sitekey]');
+          if (widget) sitekey = widget.getAttribute('data-sitekey') || '';
+        }
+        if (sitekey) {
+          push({
+            type: 'turnstile',
+            sitekey,
+            source: 'dom:input[turnstile-response]',
+          });
+        }
+        // If no sitekey found, skip — an empty sitekey entry would break the solver
       }
-      push({
-        type: 'turnstile',
-        sitekey,
-        source: 'dom:input[turnstile-response]',
-      });
     }
 
     // ── Cloudflare Challenge Page (full-page interstitial) ──

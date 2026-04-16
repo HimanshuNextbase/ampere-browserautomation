@@ -17,30 +17,53 @@ const CAPSOLVER_API = 'https://api.capsolver.com';
 function apiRequest(endpoint, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
-    const url = new URL(endpoint, CAPSOLVER_API);
+    const fullUrl = CAPSOLVER_API + endpoint;
 
-    const req = https.request(url, {
+    console.log(`[CapSolver] API request: POST ${fullUrl}`);
+
+    const parsed = new URL(fullUrl);
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-    }, (res) => {
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    };
+
+    const req = https.request(options, (res) => {
       let chunks = '';
       res.on('data', c => chunks += c);
       res.on('end', () => {
+        console.log(`[CapSolver] API response: ${res.statusCode}, body length: ${chunks.length}`);
         try {
-          const parsed = JSON.parse(chunks);
-          if (parsed.errorId && parsed.errorId !== 0) {
-            reject(new Error(`CapSolver error: ${parsed.errorCode} — ${parsed.errorDescription}`));
+          const result = JSON.parse(chunks);
+          if (result.errorId && result.errorId !== 0) {
+            const errMsg = `CapSolver error: ${result.errorCode} — ${result.errorDescription}`;
+            console.error(`[CapSolver] ${errMsg}`);
+            reject(new Error(errMsg));
           } else {
-            resolve(parsed);
+            resolve(result);
           }
         } catch (e) {
-          reject(new Error(`CapSolver response parse error: ${chunks.substring(0, 200)}`));
+          const errMsg = `CapSolver response parse error (status ${res.statusCode}): ${chunks.substring(0, 300)}`;
+          console.error(`[CapSolver] ${errMsg}`);
+          reject(new Error(errMsg));
         }
       });
     });
 
-    req.on('error', reject);
-    req.setTimeout(30000, () => { req.destroy(); reject(new Error('CapSolver API timeout')); });
+    req.on('error', (err) => {
+      console.error(`[CapSolver] Request error: ${err.message}`);
+      reject(new Error(`CapSolver request failed: ${err.message}`));
+    });
+    req.setTimeout(30000, () => {
+      req.destroy();
+      console.error('[CapSolver] Request timed out (30s)');
+      reject(new Error('CapSolver API timeout (30s)'));
+    });
     req.write(data);
     req.end();
   });

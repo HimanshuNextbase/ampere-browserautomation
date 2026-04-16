@@ -59,12 +59,32 @@ async function getOrCreateSession(sessionId) {
     fs.mkdirSync(profilePath, { recursive: true });
   }
 
-  // RAM check before launching Firefox
+  // RAM check before launching Firefox — try to free memory first if low
   const memInfo = fs.readFileSync('/proc/meminfo', 'utf-8');
   const availMatch = memInfo.match(/MemAvailable:\s+(\d+)/);
-  const availMB = availMatch ? parseInt(availMatch[1]) / 1024 : 0;
-  if (availMB < 1024) {
-    throw new Error(`Insufficient RAM: ${Math.round(availMB)}MB available, need 1024MB`);
+  let availMB = availMatch ? parseInt(availMatch[1]) / 1024 : 0;
+
+  if (availMB < 512) {
+    // Try to free RAM by closing other idle sessions before failing
+    console.log(`[Session:${sessionId}] Low RAM (${Math.round(availMB)}MB), closing idle sessions to free memory...`);
+    for (const [id, s] of sessions) {
+      if (id !== sessionId && s.browser && s.browser.isConnected()) {
+        await s.browser.close().catch(() => {});
+        sessions.delete(id);
+        console.log(`[Session:${id}] Closed to free RAM`);
+      }
+    }
+    // Re-check after closing
+    const memInfo2 = fs.readFileSync('/proc/meminfo', 'utf-8');
+    const availMatch2 = memInfo2.match(/MemAvailable:\s+(\d+)/);
+    availMB = availMatch2 ? parseInt(availMatch2[1]) / 1024 : 0;
+  }
+
+  if (availMB < 400) {
+    throw new Error(`Insufficient RAM: ${Math.round(availMB)}MB available, need 400MB minimum (closed idle sessions, still not enough)`);
+  }
+  if (availMB < 700) {
+    console.warn(`[Session:${sessionId}] WARNING: Low RAM (${Math.round(availMB)}MB) — browser may be slow`);
   }
 
   // Find Camoufox Firefox binary
@@ -392,28 +412,56 @@ const apiServer = http.createServer(async (req, res) => {
           } else if (action.type === 'solveCaptcha') {
             // Auto detect + solve + inject in one action
             const apiKey = action.apiKey || CAPSOLVER_KEY;
+            console.log(`[SolveCaptcha] API key present: ${!!apiKey}, key prefix: ${apiKey ? apiKey.substring(0, 8) + '...' : 'NONE'}`);
             if (!apiKey) throw new Error('No CapSolver API key. Set CAPSOLVER_KEY env or pass apiKey in action.');
 
             // Step 1: Detect
             const captchas = await detectCaptchas(page, { timeout: action.detectTimeout || 5000 });
-            console.log(`[Captcha] Detected: ${summarize(captchas)}`);
+            console.log(`[SolveCaptcha] Detected: ${summarize(captchas)}`);
 
             if (captchas.length === 0) {
+              console.log('[SolveCaptcha] No captcha found on page');
               results.push({ solved: false, reason: 'No captcha detected on page' });
             } else {
-              // Solve the first (or specified) captcha
-              const targetType = action.captchaType; // optional: force a specific type
-              const captcha = targetType
-                ? captchas.find(c => c.type === targetType) || captchas[0]
-                : captchas[0];
+              // Pick the best captcha to solve.
+              // detectCaptchas() may return multiple entries (e.g. widget div + hidden response input).
+              // Prefer entries with a non-empty sitekey — those are the actual widget, not the token input.
+              const targetType = action.captchaType;
 
-              const solveResult = await solveCaptcha(apiKey, page, captcha, {
-                autoInject: action.autoInject !== false,
-                autoSubmit: action.autoSubmit || false,
-                submitSelector: action.submitSelector,
-              });
+              const pickCaptcha = () => {
+                const list = Array.isArray(captchas) ? captchas : [];
+                const filtered = targetType ? list.filter(c => c && c.type === targetType) : list;
+                const withKey = (arr) => arr.find(c => c && (
+                  (typeof c.sitekey === 'string' && c.sitekey.trim().length > 0) ||
+                  (typeof c.publicKey === 'string' && c.publicKey.trim().length > 0) ||
+                  (typeof c.captchaId === 'string' && c.captchaId.trim().length > 0)
+                ));
+                return withKey(filtered) || withKey(list) || filtered[0] || list[0];
+              };
 
-              results.push(solveResult);
+              const captcha = pickCaptcha();
+              console.log(`[SolveCaptcha] Picked: ${captcha.type}, sitekey: ${captcha.sitekey || captcha.publicKey || captcha.captchaId || 'NONE'}, source: ${captcha.source}`);
+              console.log(`[SolveCaptcha] All detected: ${JSON.stringify(captchas.map(c => ({ type: c.type, sitekey: c.sitekey, source: c.source })))}`);
+
+              try {
+                const solveResult = await solveCaptcha(apiKey, page, captcha, {
+                  autoInject: action.autoInject !== false,
+                  autoSubmit: action.autoSubmit || false,
+                  submitSelector: action.submitSelector,
+                });
+                console.log(`[SolveCaptcha] SUCCESS: ${captcha.type} solved, token length: ${solveResult.solution?.token?.length || solveResult.solution?.gRecaptchaResponse?.length || 0}`);
+                results.push(solveResult);
+              } catch (solveErr) {
+                console.error(`[SolveCaptcha] FAILED: ${solveErr.message}`);
+                console.error(`[SolveCaptcha] Stack: ${solveErr.stack}`);
+                results.push({
+                  solved: false,
+                  error: solveErr.message,
+                  action: 'solveCaptcha',
+                  pickedCaptcha: { type: captcha.type, sitekey: captcha.sitekey, source: captcha.source },
+                  allDetected: captchas.map(c => ({ type: c.type, sitekey: c.sitekey, source: c.source })),
+                });
+              }
             }
           } else if (action.type === 'getCookies') {
             results.push(await session.context.cookies());
@@ -613,12 +661,12 @@ proxyServer.listen(8899, '127.0.0.1', () => console.log('[Proxy] Tunnel proxy on
 
 // ========== CLEANUP ==========
 
-// Auto-close idle sessions (30 min)
+// Auto-close idle sessions (15 min) and free RAM proactively
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
-    if (now - s.lastUsed > 30 * 60 * 1000) {
-      console.log(`[Session:${id}] Idle timeout, closing`);
+    if (now - s.lastUsed > 15 * 60 * 1000) {
+      console.log(`[Session:${id}] Idle timeout (15min), closing to free RAM`);
       closeSession(id);
     }
   }
