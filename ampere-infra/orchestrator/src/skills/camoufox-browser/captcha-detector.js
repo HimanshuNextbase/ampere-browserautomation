@@ -394,25 +394,31 @@ async function detectCaptchas(page, options = {}) {
     }
 
     // ── Generic image CAPTCHA (fallback heuristic) ──
-    // Look for common patterns: img near an input with captcha-related names
-    const captchaInputs = document.querySelectorAll(
-      'input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="captcha" i]'
-    );
-    if (captchaInputs.length > 0) {
-      // Check if there's a nearby image (likely the captcha image)
-      let imgSrc = '';
-      captchaInputs.forEach(input => {
-        const parent = input.closest('form') || input.parentElement;
-        if (parent) {
-          const img = parent.querySelector('img');
-          if (img) imgSrc = img.src || '';
-        }
-      });
-      push({
-        type: 'image_captcha',
-        imageSrc: imgSrc,
-        source: 'dom:input[captcha]+img',
-      });
+    // Only fire if no known captcha type was already detected
+    // (many captcha widgets use hidden inputs with "captcha" in the name for their tokens)
+    if (results.length === 0) {
+      const captchaInputs = document.querySelectorAll(
+        'input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="captcha" i]'
+      );
+      // Filter out hidden inputs (these are typically token fields, not user-facing captchas)
+      const visibleInputs = Array.from(captchaInputs).filter(
+        el => el.type !== 'hidden' && el.offsetParent !== null
+      );
+      if (visibleInputs.length > 0) {
+        let imgSrc = '';
+        visibleInputs.forEach(input => {
+          const parent = input.closest('form') || input.parentElement;
+          if (parent) {
+            const img = parent.querySelector('img');
+            if (img) imgSrc = img.src || '';
+          }
+        });
+        push({
+          type: 'image_captcha',
+          imageSrc: imgSrc,
+          source: 'dom:input[captcha]+img',
+        });
+      }
     }
 
     // ── Merge with interceptor results ──

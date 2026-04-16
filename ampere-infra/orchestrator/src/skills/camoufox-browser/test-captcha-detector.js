@@ -44,7 +44,7 @@ async function testUrl(browser, label, url) {
   console.log('='.repeat(60));
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'load', timeout: 45000 });
 
     // Detect captchas (waits 3s for dynamic rendering)
     const captchas = await detectCaptchas(page, { timeout: 3000 });
