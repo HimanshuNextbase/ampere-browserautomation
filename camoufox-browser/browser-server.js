@@ -6,6 +6,12 @@ const path = require('path');
 const { WebSocketServer, WebSocket } = require('ws');
 const { execSync } = require('child_process');
 const { injectInterceptors, detectCaptchas, summarize, to2CaptchaParams } = require('./captcha-detector');
+const { solveCaptcha, getBalance } = require('./captcha-solver');
+
+// CapSolver API key — read from env or file
+const CAPSOLVER_KEY = process.env.CAPSOLVER_KEY || (() => {
+  try { return fs.readFileSync('/data/capsolver-key', 'utf-8').trim(); } catch { return ''; }
+})();
 
 const PROFILE_DIR = '/data/browser-profiles';
 let sessions = new Map(); // sessionId -> { browser, context, page, profilePath }
@@ -379,10 +385,36 @@ const apiServer = http.createServer(async (req, res) => {
             const captchas = await detectCaptchas(page, { timeout: action.timeout || 5000 });
             const mapped = captchas.map(c => ({
               ...c,
-              twoCaptchaParams: to2CaptchaParams(c) || undefined,
+              capSolverTask: (() => { try { const { buildCapSolverTask } = require('./captcha-solver'); return buildCapSolverTask(c) || undefined; } catch { return undefined; } })(),
             }));
             console.log(`[Captcha] ${summarize(captchas)}`);
             results.push(mapped);
+          } else if (action.type === 'solveCaptcha') {
+            // Auto detect + solve + inject in one action
+            const apiKey = action.apiKey || CAPSOLVER_KEY;
+            if (!apiKey) throw new Error('No CapSolver API key. Set CAPSOLVER_KEY env or pass apiKey in action.');
+
+            // Step 1: Detect
+            const captchas = await detectCaptchas(page, { timeout: action.detectTimeout || 5000 });
+            console.log(`[Captcha] Detected: ${summarize(captchas)}`);
+
+            if (captchas.length === 0) {
+              results.push({ solved: false, reason: 'No captcha detected on page' });
+            } else {
+              // Solve the first (or specified) captcha
+              const targetType = action.captchaType; // optional: force a specific type
+              const captcha = targetType
+                ? captchas.find(c => c.type === targetType) || captchas[0]
+                : captchas[0];
+
+              const solveResult = await solveCaptcha(apiKey, page, captcha, {
+                autoInject: action.autoInject !== false,
+                autoSubmit: action.autoSubmit || false,
+                submitSelector: action.submitSelector,
+              });
+
+              results.push(solveResult);
+            }
           } else if (action.type === 'getCookies') {
             results.push(await session.context.cookies());
           } else if (action.type === 'setCookie') {

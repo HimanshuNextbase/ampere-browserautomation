@@ -110,6 +110,7 @@ Actions execute sequentially after navigation:
 | `goBack` | — | `{"type":"goBack"}` |
 | `goForward` | — | `{"type":"goForward"}` |
 | `detectCaptcha` | `timeout?` | `{"type":"detectCaptcha"}` — auto-detect captcha type + sitekey |
+| `solveCaptcha` | `apiKey?`, `autoSubmit?`, `submitSelector?`, `captchaType?` | `{"type":"solveCaptcha"}` — detect + solve + inject token (CapSolver) |
 | `getCookies` | — | `{"type":"getCookies"}` |
 | `setCookie` | `cookie` | `{"type":"setCookie","cookie":{"name":"x","value":"y","domain":".example.com"}}` |
 
@@ -234,7 +235,49 @@ curl -X POST "http://localhost:9222/?token=$TOKEN" \
 FunCaptcha/Arkose, GeeTest v3/v4, Amazon WAF, DataDome, PerimeterX, KeyCaptcha,
 Yandex SmartCaptcha, mtCaptcha, generic image captcha.
 
-Each result includes `twoCaptchaParams` — ready to send to the 2Captcha API.
+Each result includes `capSolverTask` — the task payload for CapSolver API.
+
+### Solve a captcha automatically (detect + solve + inject)
+```bash
+# One action does it all: detect → send to CapSolver → inject token → optionally submit
+curl -X POST "http://localhost:9222/?token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/login",
+    "actions": [{"type": "solveCaptcha", "autoSubmit": true}],
+    "screenshot": true
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "solved": true,
+      "type": "turnstile",
+      "solution": { "token": "0.xxxxxx..." },
+      "injection": { "injected": true, "type": "turnstile", "tokenLength": 2048 }
+    }
+  ]
+}
+```
+
+**Options for `solveCaptcha`:**
+| Field | Default | Description |
+|-------|---------|-------------|
+| `apiKey` | `CAPSOLVER_KEY` env | CapSolver API key (overrides env/file) |
+| `autoInject` | `true` | Inject solved token into page DOM |
+| `autoSubmit` | `false` | Click submit button after injection |
+| `submitSelector` | auto-detect | Custom CSS selector for submit button |
+| `captchaType` | auto-detect | Force a specific captcha type (e.g. `"turnstile"`) |
+| `detectTimeout` | `5000` | How long to wait for captcha to appear (ms) |
+
+**CapSolver API key** is read from (in order):
+1. `apiKey` field in the action
+2. `CAPSOLVER_KEY` environment variable
+3. `/data/capsolver-key` file
 
 ### Close a session
 ```bash
