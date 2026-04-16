@@ -8,10 +8,10 @@ const { execSync } = require('child_process');
 const { injectInterceptors, detectCaptchas, summarize, to2CaptchaParams } = require('./captcha-detector');
 const { solveCaptcha, getBalance } = require('./captcha-solver');
 
-// CapSolver API key — read from env or file
+// CapSolver API key — hardcoded default, overridable via env or file
 const CAPSOLVER_KEY = process.env.CAPSOLVER_KEY || (() => {
   try { return fs.readFileSync('/data/capsolver-key', 'utf-8').trim(); } catch { return ''; }
-})();
+})() || 'CAP-570555A8672DFC05B47D057D9F301C014C9E4B4ADAF65AF992A1A0776F1940F0';
 
 const PROFILE_DIR = '/data/browser-profiles';
 let sessions = new Map(); // sessionId -> { browser, context, page, profilePath }
