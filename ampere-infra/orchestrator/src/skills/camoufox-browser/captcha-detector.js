@@ -40,7 +40,6 @@ const INTERCEPTOR_SCRIPT = `
   }
 
   // --- reCAPTCHA v2/v3 ---
-  // Hook grecaptcha.render and grecaptcha.execute
   let _origRender, _origExecute;
 
   function patchGrecaptcha() {
@@ -50,7 +49,7 @@ const INTERCEPTOR_SCRIPT = `
       _origRender = window.grecaptcha.render;
       window.grecaptcha.render = function(container, params) {
         const sitekey = params && params.sitekey;
-        const size = params && params.size; // 'invisible' = v2 invisible
+        const size = params && params.size;
         pushCaptcha({
           type: size === 'invisible' ? 'recaptcha_v2_invisible' : 'recaptcha_v2',
           sitekey: sitekey || '',
@@ -159,22 +158,58 @@ async function injectInterceptors(pageOrContext) {
  * Detect all captchas on a Playwright page.
  * Returns an array of detected captcha objects.
  *
+ * Uses a retry strategy: scans immediately, then retries up to maxRetries
+ * times with delays to catch slow-loading captchas (especially through proxies).
+ *
  * @param {import('playwright-core').Page} page
  * @param {object} [options]
- * @param {number} [options.timeout=2000] - Extra wait (ms) for lazy-loaded captchas
+ * @param {number} [options.timeout=5000] - Initial wait (ms) for captcha widgets to render
+ * @param {number} [options.maxRetries=3] - Number of additional scan attempts if first scan finds nothing
+ * @param {number} [options.retryDelay=2000] - Delay (ms) between retries
  * @returns {Promise<Array<{type: string, sitekey?: string, pageUrl: string, ...}>>}
  */
 async function detectCaptchas(page, options = {}) {
-  const { timeout = 2000 } = options;
+  const { timeout = 5000, maxRetries = 3, retryDelay = 2000 } = options;
 
-  // Give dynamic captchas a moment to render
+  // Initial wait for captcha widgets to render
   if (timeout > 0) {
-    await page.waitForTimeout(timeout);
+    // Try to wait for common captcha selectors first (faster than blind timeout)
+    const captchaSelectors = [
+      '.g-recaptcha', 'iframe[src*="recaptcha"]',
+      '.h-captcha', 'iframe[src*="hcaptcha"]',
+      '.cf-turnstile', 'iframe[src*="challenges.cloudflare.com"]',
+      'iframe[src*="arkoselabs"]',
+      '[class*="geetest"]',
+      '#px-captcha',
+      '#captcha-container',
+    ].join(', ');
+
+    try {
+      await page.waitForSelector(captchaSelectors, { timeout });
+    } catch {
+      // No known captcha selector appeared within timeout — still run DOM scan
+      // (script tags, interceptor results, or less common captchas may still be present)
+    }
   }
 
   const pageUrl = page.url();
 
-  const detected = await page.evaluate(() => {
+  // Run scan, retry if empty (captcha may still be loading through proxy)
+  let detected = await runDomScan(page);
+
+  for (let retry = 0; retry < maxRetries && detected.length === 0; retry++) {
+    await page.waitForTimeout(retryDelay);
+    detected = await runDomScan(page);
+  }
+
+  return detected.map(c => ({ ...c, pageUrl }));
+}
+
+/**
+ * Single DOM scan pass — called by detectCaptchas (possibly multiple times).
+ */
+async function runDomScan(page) {
+  return page.evaluate(() => {
     const results = [];
 
     function push(entry) {
@@ -184,7 +219,6 @@ async function detectCaptchas(page, options = {}) {
       if (!exists) results.push(entry);
     }
 
-    // Helper: extract sitekey from element's data attributes
     function getSitekey(el) {
       return (
         el.getAttribute('data-sitekey') ||
@@ -195,7 +229,6 @@ async function detectCaptchas(page, options = {}) {
     }
 
     // ── reCAPTCHA v2 ──
-    // Visible checkbox widget
     document.querySelectorAll('.g-recaptcha').forEach(el => {
       push({
         type: 'recaptcha_v2',
@@ -204,11 +237,9 @@ async function detectCaptchas(page, options = {}) {
       });
     });
 
-    // reCAPTCHA iframe
     document.querySelectorAll('iframe').forEach(iframe => {
       const src = iframe.src || '';
       if (src.includes('recaptcha/api2/anchor') || src.includes('recaptcha/api2/bframe')) {
-        // Extract sitekey from iframe src: &k=SITEKEY
         const m = src.match(/[?&]k=([^&]+)/);
         push({
           type: 'recaptcha_v2',
@@ -226,10 +257,9 @@ async function detectCaptchas(page, options = {}) {
       }
     });
 
-    // ── reCAPTCHA v3 (script tag, no visible widget) ──
+    // ── reCAPTCHA v3 ──
     document.querySelectorAll('script').forEach(script => {
       const src = script.src || '';
-      // render=SITEKEY in the script URL means v3
       const m = src.match(/recaptcha\/api\.js\?.*render=([^&]+)/);
       if (m && m[1] !== 'explicit') {
         push({
@@ -262,6 +292,7 @@ async function detectCaptchas(page, options = {}) {
     });
 
     // ── Cloudflare Turnstile ──
+    // 1. Widget container div (most reliable — present in initial HTML)
     document.querySelectorAll('.cf-turnstile').forEach(el => {
       push({
         type: 'turnstile',
@@ -270,6 +301,16 @@ async function detectCaptchas(page, options = {}) {
       });
     });
 
+    // 2. Turnstile div may also use id="cf-turnstile" or data-turnstile-* attrs
+    document.querySelectorAll('[data-turnstile-sitekey]').forEach(el => {
+      push({
+        type: 'turnstile',
+        sitekey: el.getAttribute('data-turnstile-sitekey') || '',
+        source: 'dom:[data-turnstile-sitekey]',
+      });
+    });
+
+    // 3. Turnstile iframe (appears after JS renders the widget)
     document.querySelectorAll('iframe').forEach(iframe => {
       const src = iframe.src || '';
       if (src.includes('challenges.cloudflare.com')) {
@@ -282,11 +323,59 @@ async function detectCaptchas(page, options = {}) {
       }
     });
 
+    // 4. Turnstile script tag (catches it even before widget renders)
+    document.querySelectorAll('script').forEach(script => {
+      const src = script.src || '';
+      if (src.includes('challenges.cloudflare.com/turnstile')) {
+        // Try to find sitekey from a nearby .cf-turnstile div or any element with data-sitekey
+        let sitekey = '';
+        const widget = document.querySelector('.cf-turnstile') ||
+                       document.querySelector('[data-sitekey]') ||
+                       document.querySelector('[data-turnstile-sitekey]');
+        if (widget) {
+          sitekey = widget.getAttribute('data-sitekey') ||
+                    widget.getAttribute('data-turnstile-sitekey') || '';
+        }
+        // Also check render= param in script URL: api.js?render=explicit&onload=...
+        if (!sitekey) {
+          const renderMatch = src.match(/[?&]render=([^&]+)/);
+          if (renderMatch && renderMatch[1] !== 'explicit') {
+            sitekey = renderMatch[1];
+          }
+        }
+        push({
+          type: 'turnstile',
+          sitekey,
+          source: 'dom:script[turnstile]',
+        });
+      }
+    });
+
+    // 5. Turnstile response input (hidden input created by Turnstile after solving)
+    const turnstileInput = document.querySelector('input[name="cf-turnstile-response"]') ||
+                           document.querySelector('[name*="turnstile"]');
+    if (turnstileInput && results.every(r => r.type !== 'turnstile')) {
+      // Turnstile is present but we haven't detected it via other methods
+      const form = turnstileInput.closest('form');
+      let sitekey = '';
+      if (form) {
+        const widget = form.querySelector('.cf-turnstile') || form.querySelector('[data-sitekey]');
+        if (widget) sitekey = widget.getAttribute('data-sitekey') || '';
+      }
+      push({
+        type: 'turnstile',
+        sitekey,
+        source: 'dom:input[turnstile-response]',
+      });
+    }
+
     // ── Cloudflare Challenge Page (full-page interstitial) ──
     if (
       document.querySelector('#challenge-form') ||
       document.querySelector('#cf-challenge-running') ||
-      document.querySelector('.cf-browser-verification')
+      document.querySelector('.cf-browser-verification') ||
+      document.querySelector('#challenge-running') ||
+      document.querySelector('#challenge-stage')
     ) {
       push({
         type: 'cloudflare_challenge',
@@ -308,7 +397,6 @@ async function detectCaptchas(page, options = {}) {
       }
     });
 
-    // Arkose container div
     document.querySelectorAll('[data-public-key]').forEach(el => {
       push({
         type: 'funcaptcha',
@@ -395,12 +483,10 @@ async function detectCaptchas(page, options = {}) {
 
     // ── Generic image CAPTCHA (fallback heuristic) ──
     // Only fire if no known captcha type was already detected
-    // (many captcha widgets use hidden inputs with "captcha" in the name for their tokens)
     if (results.length === 0) {
       const captchaInputs = document.querySelectorAll(
         'input[name*="captcha" i], input[id*="captcha" i], input[placeholder*="captcha" i]'
       );
-      // Filter out hidden inputs (these are typically token fields, not user-facing captchas)
       const visibleInputs = Array.from(captchaInputs).filter(
         el => el.type !== 'hidden' && el.offsetParent !== null
       );
@@ -433,19 +519,14 @@ async function detectCaptchas(page, options = {}) {
 
     return results;
   });
-
-  // Attach pageUrl to every result
-  return detected.map(c => ({ ...c, pageUrl }));
 }
 
 // ============================================================
-// 3. Convenience: detect + summarize
+// 3. Convenience helpers
 // ============================================================
 
 /**
  * Quick summary string for logging.
- * @param {Array} captchas - Output from detectCaptchas()
- * @returns {string}
  */
 function summarize(captchas) {
   if (captchas.length === 0) return 'No captcha detected';
@@ -457,4 +538,35 @@ function summarize(captchas) {
     .join(', ');
 }
 
-module.exports = { injectInterceptors, detectCaptchas, summarize };
+/**
+ * Map detected captcha to 2Captcha API method and params.
+ * Returns null if the type is not solvable via 2Captcha.
+ */
+function to2CaptchaParams(captcha) {
+  const base = { pageurl: captcha.pageUrl };
+
+  switch (captcha.type) {
+    case 'recaptcha_v2':
+      return { method: 'userrecaptcha', googlekey: captcha.sitekey, ...base };
+    case 'recaptcha_v2_invisible':
+      return { method: 'userrecaptcha', googlekey: captcha.sitekey, invisible: 1, ...base };
+    case 'recaptcha_v3':
+      return { method: 'userrecaptcha', googlekey: captcha.sitekey, version: 'v3', action: captcha.action || '', min_score: 0.3, ...base };
+    case 'recaptcha_enterprise':
+      return { method: 'userrecaptcha', googlekey: captcha.sitekey, enterprise: 1, ...base };
+    case 'hcaptcha':
+      return { method: 'hcaptcha', sitekey: captcha.sitekey, ...base };
+    case 'turnstile':
+      return { method: 'turnstile', sitekey: captcha.sitekey, ...base };
+    case 'funcaptcha':
+      return { method: 'funcaptcha', publickey: captcha.publicKey, ...base };
+    case 'geetest_v4':
+      return { method: 'geetest_v4', captcha_id: captcha.captchaId, ...base };
+    case 'image_captcha':
+      return { method: 'base64', body: captcha.imageSrc || '', ...base };
+    default:
+      return null;
+  }
+}
+
+module.exports = { injectInterceptors, detectCaptchas, summarize, to2CaptchaParams };

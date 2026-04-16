@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { WebSocketServer, WebSocket } = require('ws');
 const { execSync } = require('child_process');
+const { injectInterceptors, detectCaptchas, summarize, to2CaptchaParams } = require('./captcha-detector');
 
 const PROFILE_DIR = '/data/browser-profiles';
 let sessions = new Map(); // sessionId -> { browser, context, page, profilePath }
@@ -129,6 +130,9 @@ async function getOrCreateSession(sessionId) {
     });
   }
 
+  // Inject captcha detection interceptors (hooks grecaptcha, hcaptcha, turnstile, etc.)
+  await injectInterceptors(context);
+
   // Camoufox handles most stealth natively (webdriver, fingerprinting, etc.)
   // Only add minimal supplementary injections
   await context.addInitScript(() => {
@@ -211,6 +215,9 @@ async function swapProxyForAllSessions() {
           return route.continue();
         });
       }
+
+      // Re-inject captcha detection interceptors
+      await injectInterceptors(newContext);
 
       // Re-inject stealth scripts
       await newContext.addInitScript(() => {
@@ -368,6 +375,14 @@ const apiServer = http.createServer(async (req, res) => {
             await page.goBack({ waitUntil: 'domcontentloaded' });
           } else if (action.type === 'goForward') {
             await page.goForward({ waitUntil: 'domcontentloaded' });
+          } else if (action.type === 'detectCaptcha') {
+            const captchas = await detectCaptchas(page, { timeout: action.timeout || 5000 });
+            const mapped = captchas.map(c => ({
+              ...c,
+              twoCaptchaParams: to2CaptchaParams(c) || undefined,
+            }));
+            console.log(`[Captcha] ${summarize(captchas)}`);
+            results.push(mapped);
           } else if (action.type === 'getCookies') {
             results.push(await session.context.cookies());
           } else if (action.type === 'setCookie') {

@@ -109,6 +109,7 @@ Actions execute sequentially after navigation:
 | `hover` | `selector` | `{"type":"hover","selector":".menu"}` |
 | `goBack` | — | `{"type":"goBack"}` |
 | `goForward` | — | `{"type":"goForward"}` |
+| `detectCaptcha` | `timeout?` | `{"type":"detectCaptcha"}` — auto-detect captcha type + sitekey |
 | `getCookies` | — | `{"type":"getCookies"}` |
 | `setCookie` | `cookie` | `{"type":"setCookie","cookie":{"name":"x","value":"y","domain":".example.com"}}` |
 
@@ -200,6 +201,40 @@ curl -X POST "http://localhost:9222/?token=$TOKEN" \
     "screenshot": false
   }'
 ```
+
+### Detect captcha on a page
+```bash
+curl -X POST "http://localhost:9222/?token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/login",
+    "actions": [{"type": "detectCaptcha"}],
+    "screenshot": false
+  }'
+```
+
+**Response `results[0]` contains detected captchas:**
+```json
+[
+  {
+    "type": "turnstile",
+    "sitekey": "0x4AAAAAAABS7TtLxsNa7Z2e",
+    "pageUrl": "https://example.com/login",
+    "source": "dom:.cf-turnstile",
+    "twoCaptchaParams": {
+      "method": "turnstile",
+      "sitekey": "0x4AAAAAAABS7TtLxsNa7Z2e",
+      "pageurl": "https://example.com/login"
+    }
+  }
+]
+```
+
+**Supported captcha types:** reCAPTCHA v2/v3/enterprise, hCaptcha, Cloudflare Turnstile,
+FunCaptcha/Arkose, GeeTest v3/v4, Amazon WAF, DataDome, PerimeterX, KeyCaptcha,
+Yandex SmartCaptcha, mtCaptcha, generic image captcha.
+
+Each result includes `twoCaptchaParams` — ready to send to the 2Captcha API.
 
 ### Close a session
 ```bash
