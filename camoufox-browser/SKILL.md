@@ -16,6 +16,42 @@ Sessions are saved to disk — cookies, logins, and state survive across calls.
 - **Desktop proxy:** Route traffic through user's residential IP
 - **Actions:** Click, type, scroll, screenshot, extract text/HTML, evaluate JS
 - **Captcha solving:** Auto-detect + solve captchas via CapSolver (Turnstile, reCAPTCHA, hCaptcha, etc.)
+- **File upload/download:** Upload files to websites, download results
+
+---
+
+## CRITICAL: Be Autonomous — Do Not Ask, Just Do
+
+**NEVER ask the user questions like:**
+- "Is there a login page?"
+- "What should I click?"
+- "How does this site work?"
+- "Should I try X or Y?"
+- "Can you describe the page layout?"
+
+**INSTEAD, use the browser to figure it out yourself:**
+
+1. **Navigate to the URL** with `getText` + `screenshot` to see what's there.
+2. **Explore the page** with `findElements` to discover buttons, inputs, links.
+3. **Try things** — click buttons, scroll, wait for dynamic content.
+4. **If something doesn't work**, try a different approach (different selector, scroll down, wait longer, check iframes).
+5. **Only ask the user if you genuinely need credentials** (username/password) that you cannot guess.
+
+You have a full browser at your disposal. You can see pages, click buttons, fill forms, upload files, download files, solve captchas, and take screenshots. There is almost nothing you cannot figure out by exploring the page yourself.
+
+**Workflow for ANY browser task the user gives you:**
+```
+Step 1: Go to the URL → getText + screenshot → understand the page
+Step 2: Find interactive elements → findElements("button, a, input, [role=button], form")
+Step 3: Do the task (fill forms, upload files, click buttons)
+Step 4: Wait for results → wait + waitForSelector + screenshot
+Step 5: Get the output (download, screenshotElement, getText)
+Step 6: Return the result to the user
+```
+
+If the site has a captcha, solve it with `solveCaptcha`. If the site needs a file upload, use `uploadFileFromUrl`. If you need to click something but don't know the selector, use `clickText`. If content loads dynamically, use `wait` + `waitForSelector`.
+
+**Do NOT give up.** If the first approach fails, try another. Scroll down, check iframes, try different selectors, wait longer. You have retry capability — use it. The user expects results, not questions.
 
 ---
 
@@ -64,7 +100,8 @@ All browsing is done via POST with a JSON body:
   "fullPage": false,
   "timeout": 60000,
   "newTab": false,
-  "closeBrowser": false
+  "closeBrowser": false,
+  "autoCaptcha": true
 }
 ```
 
@@ -121,6 +158,15 @@ Actions execute sequentially after navigation:
 | `solveCaptcha` | `autoSubmit?`, `submitSelector?`, `captchaType?`, `detectTimeout?` | `{"type":"solveCaptcha"}` -- detect + solve + inject token via CapSolver |
 | `getCookies` | -- | `{"type":"getCookies"}` |
 | `setCookie` | `cookie` | `{"type":"setCookie","cookie":{"name":"x","value":"y","domain":".example.com"}}` |
+| `uploadFile` | `selector`, `files` | `{"type":"uploadFile","selector":"input[type=file]","files":["/tmp/photo.jpg"]}` |
+| `uploadFileFromUrl` | `selector`, `fileUrl` | `{"type":"uploadFileFromUrl","selector":"input[type=file]","fileUrl":"https://example.com/photo.jpg"}` |
+| `download` | `selector`, `savePath?` | `{"type":"download","selector":"a.download-btn"}` -- click + capture download |
+| `screenshotElement` | `selector` | `{"type":"screenshotElement","selector":".result-image"}` -- screenshot one element |
+| `waitForUrl` | `pattern`, `timeout?` | `{"type":"waitForUrl","pattern":"**/success**"}` -- wait for URL change |
+| `getAttributes` | `selector` | `{"type":"getAttributes","selector":"#result"}` -- get all attributes of element |
+| `findElements` | `selector` | `{"type":"findElements","selector":"button"}` -- list all matching elements |
+| `clickText` | `text`, `exact?` | `{"type":"clickText","text":"Download"}` -- click by visible text |
+| `dragAndDrop` | `source`, `target` | `{"type":"dragAndDrop","source":"#file","target":"#dropzone"}` |
 
 ### Special URLs
 - `"__close__"` -- Close a session: `{"url":"__close__","sessionId":"gmail"}`
@@ -130,6 +176,22 @@ Actions execute sequentially after navigation:
 ---
 
 ## Captcha Detection and Solving
+
+### Auto-captcha (enabled by default)
+
+Captchas are **automatically detected and solved** during automation. You do NOT need to add `solveCaptcha` actions manually in most cases.
+
+Auto-captcha triggers:
+- **After navigation** — if the page you navigated to has a captcha, it's solved before actions run
+- **After click** — if clicking a button triggers a captcha page, it's solved automatically
+- **After clickText** — same as click
+- **After waitForNavigation** — if a redirect lands on a captcha page
+
+The auto-captcha uses a fast 1.5s scan (no retries) to avoid slowing down every action. If it detects a captcha with a valid sitekey, it solves it via CapSolver and injects the token.
+
+To disable auto-captcha for a specific request, set `"autoCaptcha": false` in the POST body.
+
+You can still use `{"type": "solveCaptcha"}` explicitly for cases where you want to force captcha solving (e.g., captcha appears after a wait/delay, not immediately after click).
 
 ### Supported captcha types
 
@@ -332,6 +394,191 @@ curl "http://localhost:9222/?token=$TOKEN" | jq .desktopProxy
 | Site blocks/captcha | Server IP detected | Enable desktop proxy (residential IP), or use `solveCaptcha` |
 | `solveCaptcha` returns `solved:false` | Empty sitekey picked | Check `allDetected` in error response; captcha may need longer `detectTimeout` |
 | `DISPLAY` errors in logs | Xvfb not running | `systemctl start xvfb` |
+
+---
+
+## Agent Strategy Guide
+
+**IMPORTANT: You CAN and SHOULD use this skill for complex browser automation tasks.**
+If a user asks you to browse a website, upload files, download results, fill forms, or interact with web apps — use this skill. **NEVER say "no", "I can't", or ask the user how the site works.** You have a real browser — open the site and look at it yourself. Follow these strategies:
+
+### Strategy 1: Explore first, act second
+Before clicking blindly, understand the page:
+```json
+{"actions": [
+  {"type": "getText", "selector": "body"},
+  {"type": "findElements", "selector": "button, a, input, [role=button]"}
+]}
+```
+This tells you what's on the page and what you can interact with.
+
+### Strategy 2: Use screenshots when text isn't enough
+If getText returns confusing content (SPA, dynamic app), take a screenshot:
+```json
+{"actions": [], "screenshot": true}
+```
+Then read the screenshot to visually understand the layout.
+
+### Strategy 3: Upload files to websites
+```json
+{"actions": [
+  {"type": "uploadFileFromUrl", "selector": "input[type=file]", "fileUrl": "https://example.com/image.jpg"},
+  {"type": "wait", "ms": 3000},
+  {"type": "screenshot"}
+]}
+```
+If the file input is hidden (drag-and-drop zones), find it with:
+```json
+{"actions": [{"type": "findElements", "selector": "input[type=file]"}]}
+```
+Hidden file inputs still work with `uploadFile` — Playwright bypasses visibility.
+
+### Strategy 4: Handle dynamic content (SPAs)
+After clicking a button, content may load asynchronously. Don't just getText immediately:
+```json
+{"actions": [
+  {"type": "click", "selector": "#generate-btn"},
+  {"type": "wait", "ms": 5000},
+  {"type": "waitForSelector", "selector": ".result, .output, .download, [class*=result]", "timeout": 30000},
+  {"type": "getText", "selector": "body"}
+]}
+```
+
+### Strategy 5: Download results
+```json
+{"actions": [
+  {"type": "download", "selector": "a[download], .download-btn, a[href*=download]"}
+]}
+```
+Response includes `base64` of the file (if < 5MB). For images, use `screenshotElement`:
+```json
+{"actions": [
+  {"type": "screenshotElement", "selector": "img.result, canvas, .output-image"}
+]}
+```
+
+### Strategy 6: Multi-step workflows
+Break complex tasks into multiple API calls with the SAME sessionId:
+```
+Call 1: Navigate + explore page structure
+Call 2: Upload file + wait for processing  
+Call 3: Click generate + wait for result
+Call 4: Download/screenshot result
+```
+The session preserves all state between calls.
+
+### Strategy 7: Find clickable elements by text
+When you don't know the selector:
+```json
+{"actions": [{"type": "clickText", "text": "Generate"}, {"type": "wait", "ms": 3000}]}
+```
+
+### Strategy 8: Debug when stuck
+If you can't find an element, use evaluate to inspect the DOM:
+```json
+{"actions": [{"type": "evaluate", "script": "document.querySelectorAll('iframe').length"}]}
+```
+Check for iframes, shadow DOM, or lazy-loaded content:
+```json
+{"actions": [{"type": "evaluate", "script": "JSON.stringify(Array.from(document.querySelectorAll('iframe')).map(f => f.src))"}]}
+```
+
+### Common patterns
+
+**Upload image to a web tool and get result:**
+```bash
+# Step 1: Go to site + upload
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "https://tool-site.com",
+  "sessionId": "task1",
+  "actions": [
+    {"type": "uploadFileFromUrl", "selector": "input[type=file]", "fileUrl": "https://example.com/photo.jpg"},
+    {"type": "wait", "ms": 3000}
+  ], "screenshot": true
+}'
+
+# Step 2: Click generate and wait
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "__current__",
+  "sessionId": "task1",
+  "actions": [
+    {"type": "clickText", "text": "Generate"},
+    {"type": "wait", "ms": 10000}
+  ], "screenshot": true
+}'
+
+# Step 3: Download or screenshot result
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "__current__",
+  "sessionId": "task1",
+  "actions": [
+    {"type": "screenshotElement", "selector": "img.result, .output img, canvas"}
+  ]
+}'
+```
+
+**Use an online image/AI tool (upload → process → download):**
+```bash
+# Step 1: Go to the tool, explore what's on the page
+TOKEN=$(cat /data/browser-server-token)
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "https://some-image-tool.com",
+  "sessionId": "img-task",
+  "actions": [
+    {"type": "findElements", "selector": "input[type=file], button, a, [role=button]"},
+    {"type": "getText", "selector": "body"}
+  ], "screenshot": true
+}'
+
+# Step 2: Upload the input image (works even with hidden file inputs / drag-drop zones)
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "__current__",
+  "sessionId": "img-task",
+  "actions": [
+    {"type": "uploadFileFromUrl", "selector": "input[type=file]", "fileUrl": "https://example.com/photo.jpg"},
+    {"type": "wait", "ms": 5000}
+  ], "screenshot": true
+}'
+
+# Step 3: If there is a captcha, solve it. Then click process/generate button.
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "__current__",
+  "sessionId": "img-task",
+  "actions": [
+    {"type": "solveCaptcha"},
+    {"type": "clickText", "text": "Generate"},
+    {"type": "wait", "ms": 10000},
+    {"type": "findElements", "selector": "img, canvas, a[download], [class*=result], [class*=output]"}
+  ], "screenshot": true
+}'
+
+# Step 4: Download or screenshot the result
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "__current__",
+  "sessionId": "img-task",
+  "actions": [
+    {"type": "screenshotElement", "selector": "img.result, .output img, canvas, [class*=result] img"}
+  ]
+}'
+
+# Step 5: Clean up
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "__close__", "sessionId": "img-task"
+}'
+```
+
+**Handle sites behind captcha:**
+```bash
+curl -X POST "http://localhost:9222/?token=$TOKEN" -H "Content-Type: application/json" -d '{
+  "url": "https://protected-site.com",
+  "sessionId": "captcha-task",
+  "actions": [
+    {"type": "solveCaptcha", "autoSubmit": true},
+    {"type": "wait", "ms": 3000},
+    {"type": "getText", "selector": "body"}
+  ], "screenshot": true
+}'
+```
 
 ---
 

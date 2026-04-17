@@ -167,6 +167,7 @@ function buildCapSolverTask(captcha) {
     case 'turnstile':
       return {
         type: 'AntiTurnstileTaskProxyLess',
+        metadata: { type: 'turnstile' },
         websiteURL: url,
         websiteKey: captcha.sitekey,
       };
@@ -396,7 +397,7 @@ async function injectSolution(page, captchaType, solution) {
  * @returns {Promise<{solved: boolean, type: string, solution: object, injection: object}>}
  */
 async function solveCaptcha(clientKey, page, captcha, options = {}) {
-  const { autoInject = true, autoSubmit = false, submitSelector } = options;
+  const { autoInject = true, autoSubmit = false, submitSelector, allCaptchas = [] } = options;
 
   // Build CapSolver task
   const task = buildCapSolverTask(captcha);
@@ -404,10 +405,57 @@ async function solveCaptcha(clientKey, page, captcha, options = {}) {
     throw new Error(`Unsupported captcha type for solving: ${captcha.type}`);
   }
 
-  console.log(`[CapSolver] Solving ${captcha.type} on ${captcha.pageUrl}`);
+  console.log(`[CapSolver] Solving ${captcha.type} on ${captcha.pageUrl}, sitekey: ${captcha.sitekey || 'N/A'}`);
 
-  // Send to CapSolver and wait for solution
-  const solution = await createTask(clientKey, task);
+  let solution;
+  try {
+    solution = await createTask(clientKey, task);
+  } catch (firstErr) {
+    console.warn(`[CapSolver] First attempt failed: ${firstErr.message}`);
+
+    // Retry with alternative sitekeys if available (some sites have multiple Turnstile widgets)
+    const alternatives = allCaptchas.filter(c =>
+      c.type === captcha.type && c.sitekey && c.sitekey !== captcha.sitekey
+    );
+
+    for (const alt of alternatives) {
+      try {
+        console.log(`[CapSolver] Retrying with alternative sitekey: ${alt.sitekey?.substring(0, 20)}...`);
+        const altTask = buildCapSolverTask(alt);
+        if (altTask) {
+          solution = await createTask(clientKey, altTask);
+          console.log(`[CapSolver] Alternative sitekey worked!`);
+          break;
+        }
+      } catch (retryErr) {
+        console.warn(`[CapSolver] Alternative also failed: ${retryErr.message}`);
+      }
+    }
+
+    if (!solution) {
+      // Last resort for Turnstile: try clicking the checkbox directly in the iframe
+      if (captcha.type === 'turnstile') {
+        console.log('[CapSolver] All API attempts failed, trying direct iframe click...');
+        try {
+          const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]').first();
+          await frame.locator('body').click({ timeout: 5000 });
+          await page.waitForTimeout(5000);
+          // Check if turnstile resolved after click
+          const resolved = await page.evaluate(() => {
+            const input = document.querySelector('input[name="cf-turnstile-response"]');
+            return input && input.value && input.value.length > 10;
+          });
+          if (resolved) {
+            console.log('[CapSolver] Direct iframe click resolved the Turnstile!');
+            return { solved: true, type: captcha.type, solution: { method: 'iframe-click' }, injection: { injected: true, type: 'turnstile', method: 'browser-native' } };
+          }
+        } catch (clickErr) {
+          console.warn('[CapSolver] iframe click failed:', clickErr.message);
+        }
+      }
+      throw firstErr; // Re-throw original error
+    }
+  }
 
   console.log(`[CapSolver] Got solution for ${captcha.type}`);
 

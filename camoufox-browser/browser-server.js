@@ -337,6 +337,7 @@ const apiServer = http.createServer(async (req, res) => {
         sessionId = 'default', // User's profile ID
         newTab = false, // Open in new tab (keep existing tabs)
         closeBrowser = false, // Close session after
+        autoCaptcha = true, // Auto-detect and solve captchas during automation
       } = JSON.parse(body);
 
       // Special actions
@@ -364,9 +365,50 @@ const apiServer = http.createServer(async (req, res) => {
         page = session.page;
       }
 
+      // Auto-captcha: detect and solve captchas that appear during automation
+      const autoSolveCaptcha = async (triggerLabel) => {
+        if (!autoCaptcha) return null;
+        const apiKey = CAPSOLVER_KEY;
+        if (!apiKey) return null;
+
+        try {
+          // Quick scan (short timeout — don't slow down every action)
+          const captchas = await detectCaptchas(page, { timeout: 1500, maxRetries: 0 });
+          if (captchas.length === 0) return null;
+
+          // Pick best captcha (with sitekey)
+          const withKey = (arr) => arr.find(c => c && (
+            (typeof c.sitekey === 'string' && c.sitekey.trim().length > 0) ||
+            (typeof c.publicKey === 'string' && c.publicKey.trim().length > 0)
+          ));
+          const captcha = withKey(captchas) || captchas[0];
+          if (!captcha.sitekey && !captcha.publicKey) return null;
+
+          console.log(`[AutoCaptcha] Detected ${captcha.type} after ${triggerLabel}, solving...`);
+          const result = await solveCaptcha(apiKey, page, captcha, {
+            autoInject: true,
+            autoSubmit: false,
+            allCaptchas: captchas,
+          });
+          console.log(`[AutoCaptcha] Solved ${captcha.type}, token length: ${result.solution?.token?.length || result.solution?.gRecaptchaResponse?.length || 0}`);
+          return result;
+        } catch (err) {
+          console.warn(`[AutoCaptcha] Failed after ${triggerLabel}: ${err.message}`);
+          return null;
+        }
+      };
+
       // Navigate
       if (url && url !== '__current__') {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+        // Check for captcha after navigation
+        const navCaptchaResult = await autoSolveCaptcha('navigation');
+        if (navCaptchaResult) {
+          // Wait for page to react after captcha solve
+          await page.waitForTimeout(2000);
+          // If page redirected or reloaded after captcha, wait for it
+          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+        }
       }
 
       // Execute actions
@@ -375,6 +417,8 @@ const apiServer = http.createServer(async (req, res) => {
         try {
           if (action.type === 'click') {
             await page.click(action.selector, { timeout: action.timeout || 10000 });
+            // Check for captcha that may appear after clicking (e.g., submit buttons)
+            await autoSolveCaptcha('click:' + action.selector);
           } else if (action.type === 'type') {
             await page.fill(action.selector, action.text);
           } else if (action.type === 'press') {
@@ -385,6 +429,8 @@ const apiServer = http.createServer(async (req, res) => {
             await page.waitForSelector(action.selector, { timeout: action.timeout || 10000 });
           } else if (action.type === 'waitForNavigation') {
             await page.waitForLoadState('domcontentloaded', { timeout: action.timeout || 15000 });
+            // Check for captcha on the new page
+            await autoSolveCaptcha('waitForNavigation');
           } else if (action.type === 'evaluate') {
             results.push(await page.evaluate(action.script));
           } else if (action.type === 'scroll') {
@@ -448,6 +494,7 @@ const apiServer = http.createServer(async (req, res) => {
                   autoInject: action.autoInject !== false,
                   autoSubmit: action.autoSubmit || false,
                   submitSelector: action.submitSelector,
+                  allCaptchas: captchas, // pass all detected for retry with alt sitekeys
                 });
                 console.log(`[SolveCaptcha] SUCCESS: ${captcha.type} solved, token length: ${solveResult.solution?.token?.length || solveResult.solution?.gRecaptchaResponse?.length || 0}`);
                 results.push(solveResult);
@@ -467,6 +514,86 @@ const apiServer = http.createServer(async (req, res) => {
             results.push(await session.context.cookies());
           } else if (action.type === 'setCookie') {
             await session.context.addCookies([action.cookie]);
+          } else if (action.type === 'uploadFile') {
+            // Upload file(s) to an <input type="file"> element
+            // files: array of absolute paths, or single path string
+            const files = Array.isArray(action.files) ? action.files : [action.files];
+            const input = await page.waitForSelector(action.selector, { timeout: action.timeout || 10000 });
+            await input.setInputFiles(files);
+            console.log(`[Upload] Set ${files.length} file(s) on ${action.selector}`);
+            results.push({ uploaded: true, files: files.length });
+          } else if (action.type === 'uploadFileFromUrl') {
+            // Download a file from URL to /tmp, then upload it to an input
+            const tmpPath = `/tmp/upload-${Date.now()}-${path.basename(action.fileUrl || 'file')}`;
+            const { execSync: exec } = require('child_process');
+            exec(`curl -sL -o "${tmpPath}" "${action.fileUrl}"`, { timeout: 30000 });
+            const input = await page.waitForSelector(action.selector, { timeout: action.timeout || 10000 });
+            await input.setInputFiles(tmpPath);
+            console.log(`[Upload] Downloaded ${action.fileUrl} -> uploaded to ${action.selector}`);
+            results.push({ uploaded: true, tmpPath });
+          } else if (action.type === 'download') {
+            // Click a download link/button and capture the downloaded file
+            const [download] = await Promise.all([
+              page.waitForEvent('download', { timeout: action.timeout || 30000 }),
+              action.selector ? page.click(action.selector) : Promise.resolve(),
+            ]);
+            const savePath = action.savePath || `/tmp/download-${Date.now()}-${download.suggestedFilename()}`;
+            await download.saveAs(savePath);
+            const stat = fs.statSync(savePath);
+            console.log(`[Download] Saved: ${savePath} (${stat.size} bytes)`);
+            // Return base64 if file is small enough (<5MB), otherwise just the path
+            if (stat.size < 5 * 1024 * 1024) {
+              const b64 = fs.readFileSync(savePath).toString('base64');
+              results.push({ downloaded: true, path: savePath, size: stat.size, filename: download.suggestedFilename(), base64: b64 });
+            } else {
+              results.push({ downloaded: true, path: savePath, size: stat.size, filename: download.suggestedFilename() });
+            }
+          } else if (action.type === 'screenshotElement') {
+            // Screenshot a specific element (not full page)
+            const el = await page.waitForSelector(action.selector, { timeout: action.timeout || 10000 });
+            const buf = await el.screenshot();
+            results.push({ screenshot: buf.toString('base64'), selector: action.selector });
+          } else if (action.type === 'waitForUrl') {
+            // Wait until URL matches a pattern (useful after form submits/redirects)
+            await page.waitForURL(action.pattern || '**', { timeout: action.timeout || 30000 });
+            results.push({ url: page.url() });
+          } else if (action.type === 'getAttributes') {
+            // Get all attributes of an element (useful for debugging/exploration)
+            const attrs = await page.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return null;
+              const result = {};
+              for (const attr of el.attributes) result[attr.name] = attr.value;
+              result._tagName = el.tagName.toLowerCase();
+              result._innerText = el.innerText?.substring(0, 500) || '';
+              result._childCount = el.children.length;
+              return result;
+            }, action.selector);
+            results.push(attrs);
+          } else if (action.type === 'findElements') {
+            // Find all elements matching a selector — returns count + info
+            const elements = await page.evaluate((sel) => {
+              const els = document.querySelectorAll(sel);
+              return Array.from(els).slice(0, 50).map((el, i) => ({
+                index: i,
+                tag: el.tagName.toLowerCase(),
+                id: el.id || undefined,
+                classes: el.className || undefined,
+                text: el.innerText?.substring(0, 200) || '',
+                href: el.href || undefined,
+                src: el.src || undefined,
+                type: el.type || undefined,
+                visible: el.offsetParent !== null,
+              }));
+            }, action.selector);
+            results.push({ count: elements.length, elements });
+          } else if (action.type === 'clickText') {
+            // Click an element by its visible text content
+            await page.getByText(action.text, { exact: action.exact || false }).first().click({ timeout: action.timeout || 10000 });
+            await autoSolveCaptcha('clickText:' + action.text);
+          } else if (action.type === 'dragAndDrop') {
+            // Drag from one element to another
+            await page.dragAndDrop(action.source, action.target, { timeout: action.timeout || 10000 });
           }
         } catch (actionErr) {
           results.push({ error: actionErr.message, action: action.type });
