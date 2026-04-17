@@ -172,6 +172,19 @@ function buildCapSolverTask(captcha) {
         websiteKey: captcha.sitekey,
       };
 
+    case 'cloudflare_challenge':
+      // Full-page Cloudflare "Just a moment..." challenge
+      // If we extracted a sitekey, solve as Turnstile
+      if (captcha.sitekey) {
+        return {
+          type: 'AntiTurnstileTaskProxyLess',
+          metadata: { type: 'turnstile' },
+          websiteURL: url,
+          websiteKey: captcha.sitekey,
+        };
+      }
+      return null;
+
     case 'funcaptcha':
       return {
         type: 'FunCaptchaTaskProxyLess',
@@ -282,6 +295,7 @@ async function injectSolution(page, captchaType, solution) {
       return { injected: true, type: captchaType, tokenLength: token.length };
     }
 
+    case 'cloudflare_challenge':
     case 'turnstile': {
       const token = solution.token;
       if (!token) throw new Error('No token in Turnstile solution');

@@ -374,19 +374,86 @@ async function runDomScan(page) {
       }
     }
 
-    // ── Cloudflare Challenge Page (full-page interstitial) ──
-    if (
+    // ── Cloudflare Challenge Page (full-page "Just a moment..." interstitial) ──
+    const isChallengeePage = !!(
       document.querySelector('#challenge-form') ||
       document.querySelector('#cf-challenge-running') ||
       document.querySelector('.cf-browser-verification') ||
       document.querySelector('#challenge-running') ||
-      document.querySelector('#challenge-stage')
-    ) {
+      document.querySelector('#challenge-stage') ||
+      document.querySelector('#cf-spinner-please-wait') ||
+      document.querySelector('.main-wrapper .core-msg')
+    );
+
+    // Also detect by page title / body text
+    const bodyText = document.body?.innerText?.toLowerCase() || '';
+    const titleText = document.title?.toLowerCase() || '';
+    const isChallengeByText = (
+      titleText.includes('just a moment') ||
+      titleText.includes('attention required') ||
+      titleText.includes('checking your browser') ||
+      bodyText.includes('verifying you are human') ||
+      bodyText.includes('checking if the site connection is secure') ||
+      bodyText.includes('performing a security check') ||
+      bodyText.includes('please wait while we verify')
+    );
+
+    if (isChallengeePage || isChallengeByText) {
+      // Extract sitekey from _cf_chl_opt or embedded scripts
+      // Cloudflare challenge pages embed the Turnstile sitekey in obfuscated JS
+      // The sitekey always matches pattern: 0x4AAAAAAA followed by alphanumeric chars
+      let challengeSitekey = '';
+
+      // Method 1: Check window._cf_chl_opt (Cloudflare stores config here)
+      if (window._cf_chl_opt) {
+        // Search all values in the config object for a sitekey pattern
+        const searchObj = (obj) => {
+          for (const key in obj) {
+            const val = obj[key];
+            if (typeof val === 'string' && /^0x[0-9a-fA-F]{8,}/.test(val)) {
+              return val;
+            }
+          }
+          return '';
+        };
+        challengeSitekey = searchObj(window._cf_chl_opt);
+      }
+
+      // Method 2: Search all script tags for sitekey pattern
+      if (!challengeSitekey) {
+        const scripts = document.querySelectorAll('script');
+        for (const script of scripts) {
+          const text = script.textContent || script.innerText || '';
+          // Match Turnstile sitekey pattern: 0x4AAAAAAA... (typically 20-30 chars)
+          const m = text.match(/['"]0x(4[A-Za-z0-9]{7,})['"]/);
+          if (m) {
+            challengeSitekey = '0x' + m[1];
+            break;
+          }
+        }
+      }
+
+      // Method 3: Search inline scripts for the sitekey in _cf_chl_opt assignment
+      if (!challengeSitekey) {
+        const html = document.documentElement.innerHTML;
+        const m = html.match(/['"]0x(4AAA[A-Za-z0-9]{4,})['"]/);
+        if (m) challengeSitekey = '0x' + m[1];
+      }
+
       push({
         type: 'cloudflare_challenge',
-        sitekey: '',
-        source: 'dom:cloudflare-challenge-page',
+        sitekey: challengeSitekey,
+        source: 'dom:cloudflare-challenge-page' + (challengeSitekey ? '+sitekey-extracted' : '+no-sitekey'),
       });
+
+      // Also push as turnstile type if we found a sitekey (for solver compatibility)
+      if (challengeSitekey && results.every(r => !(r.type === 'turnstile' && r.sitekey === challengeSitekey))) {
+        push({
+          type: 'turnstile',
+          sitekey: challengeSitekey,
+          source: 'dom:cloudflare-challenge-extracted-sitekey',
+        });
+      }
     }
 
     // ── FunCaptcha / Arkose Labs ──
