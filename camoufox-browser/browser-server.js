@@ -59,32 +59,39 @@ async function getOrCreateSession(sessionId) {
     fs.mkdirSync(profilePath, { recursive: true });
   }
 
-  // RAM check before launching Firefox — try to free memory first if low
-  const memInfo = fs.readFileSync('/proc/meminfo', 'utf-8');
-  const availMatch = memInfo.match(/MemAvailable:\s+(\d+)/);
-  let availMB = availMatch ? parseInt(availMatch[1]) / 1024 : 0;
+  // RAM check before launching Firefox
+  // Default is conservative; override via env if needed.
+  const MIN_RAM_MB = Number.parseInt(process.env.CAMOUFOX_MIN_RAM_MB || '1024', 10);
+  const WARN_RAM_MB = Number.parseInt(process.env.CAMOUFOX_WARN_RAM_MB || '1400', 10);
 
-  if (availMB < 512) {
-    // Try to free RAM by closing other idle sessions before failing
-    console.log(`[Session:${sessionId}] Low RAM (${Math.round(availMB)}MB), closing idle sessions to free memory...`);
-    for (const [id, s] of sessions) {
-      if (id !== sessionId && s.browser && s.browser.isConnected()) {
-        await s.browser.close().catch(() => {});
-        sessions.delete(id);
-        console.log(`[Session:${id}] Closed to free RAM`);
-      }
+  const readAvailMB = () => {
+    const memInfo = fs.readFileSync('/proc/meminfo', 'utf-8');
+    const availMatch = memInfo.match(/MemAvailable:\s+(\d+)/);
+    return availMatch ? parseInt(availMatch[1], 10) / 1024 : 0;
+  };
+
+  let availMB = readAvailMB();
+
+  // If we're low on RAM, try freeing memory by closing least-recently-used sessions.
+  if (availMB < MIN_RAM_MB && sessions.size > 0) {
+    console.warn(`[Session:${sessionId}] Low RAM (${Math.round(availMB)}MB < ${MIN_RAM_MB}MB). Closing other sessions to free memory...`);
+
+    const candidates = Array.from(sessions.entries())
+      .filter(([id, s]) => id !== sessionId && s && s.context)
+      .sort((a, b) => (a[1].lastUsed || 0) - (b[1].lastUsed || 0));
+
+    for (const [id] of candidates) {
+      await closeSession(id).catch(() => {});
+      availMB = readAvailMB();
+      if (availMB >= MIN_RAM_MB) break;
     }
-    // Re-check after closing
-    const memInfo2 = fs.readFileSync('/proc/meminfo', 'utf-8');
-    const availMatch2 = memInfo2.match(/MemAvailable:\s+(\d+)/);
-    availMB = availMatch2 ? parseInt(availMatch2[1]) / 1024 : 0;
   }
 
-  if (availMB < 400) {
-    throw new Error(`Insufficient RAM: ${Math.round(availMB)}MB available, need 400MB minimum (closed idle sessions, still not enough)`);
+  if (availMB < MIN_RAM_MB) {
+    throw new Error(`Insufficient RAM: ${Math.round(availMB)}MB available, need >= ${MIN_RAM_MB}MB (set CAMOUFOX_MIN_RAM_MB to override)`);
   }
-  if (availMB < 700) {
-    console.warn(`[Session:${sessionId}] WARNING: Low RAM (${Math.round(availMB)}MB) — browser may be slow`);
+  if (availMB < WARN_RAM_MB) {
+    console.warn(`[Session:${sessionId}] WARNING: Low RAM (${Math.round(availMB)}MB) — browser may be slow/unreliable`);
   }
 
   // Find Camoufox Firefox binary
@@ -156,9 +163,6 @@ async function getOrCreateSession(sessionId) {
     });
   }
 
-  // Inject captcha detection interceptors (hooks grecaptcha, hcaptcha, turnstile, etc.)
-  await injectInterceptors(context);
-
   // Camoufox handles most stealth natively (webdriver, fingerprinting, etc.)
   // Only add minimal supplementary injections
   await context.addInitScript(() => {
@@ -176,6 +180,10 @@ async function getOrCreateSession(sessionId) {
     // 11. Notification permission
     Object.defineProperty(Notification, 'permission', { get: () => 'default' });
   });
+
+  // Captcha auto-detection interceptors (from ampere-browserautomation)
+  // Inject at context level so it runs before navigation on every page.
+  await injectInterceptors(context);
 
   const page = await context.newPage();
 
@@ -241,9 +249,6 @@ async function swapProxyForAllSessions() {
           return route.continue();
         });
       }
-
-      // Re-inject captcha detection interceptors
-      await injectInterceptors(newContext);
 
       // Re-inject stealth scripts
       await newContext.addInitScript(() => {
@@ -331,12 +336,14 @@ const apiServer = http.createServer(async (req, res) => {
       const {
         url,
         actions = [],
-        screenshot = true,
+        screenshot = false, // default off to reduce payload/tokens
         fullPage = false,
         timeout = 60000, // 60s default (proxy mode can be slow)
         sessionId = 'default', // User's profile ID
         newTab = false, // Open in new tab (keep existing tabs)
         closeBrowser = false, // Close session after
+        resultMaxChars = 4000, // default cap for text/html results
+        resultMaxItems = 50, // default cap for array results
       } = JSON.parse(body);
 
       // Special actions
@@ -371,6 +378,24 @@ const apiServer = http.createServer(async (req, res) => {
 
       // Execute actions
       const results = [];
+
+      // Cap outputs to avoid huge responses (token/payload saver)
+      const cap = (val, action = {}) => {
+        const maxChars = action.maxChars ?? resultMaxChars;
+        const maxItems = action.maxItems ?? resultMaxItems;
+        if (typeof val === 'string') {
+          return maxChars ? val.slice(0, maxChars) : val;
+        }
+        if (Array.isArray(val)) {
+          let out = maxItems ? val.slice(0, maxItems) : val;
+          if (maxChars) {
+            out = out.map((x) => (typeof x === 'string' ? x.slice(0, maxChars) : x));
+          }
+          return out;
+        }
+        return val;
+      };
+
       for (const action of actions) {
         try {
           if (action.type === 'click') {
@@ -386,13 +411,29 @@ const apiServer = http.createServer(async (req, res) => {
           } else if (action.type === 'waitForNavigation') {
             await page.waitForLoadState('domcontentloaded', { timeout: action.timeout || 15000 });
           } else if (action.type === 'evaluate') {
-            results.push(await page.evaluate(action.script));
+            results.push(cap(await page.evaluate(action.script), action));
+          } else if (action.type === 'detectCaptcha' || action.type === 'detectCaptchas') {
+            const opts = {
+              timeout: action.timeout ?? 5000,
+              maxRetries: action.maxRetries ?? 3,
+              retryDelay: action.retryDelay ?? 2000,
+            };
+            const found = await detectCaptchas(page, opts);
+            const mapped = found.map(c => ({
+              ...c,
+              capSolverTask: (() => { try { const { buildCapSolverTask } = require('./captcha-solver'); return buildCapSolverTask(c) || undefined; } catch { return undefined; } })(),
+            }));
+            if (action.summary) {
+              results.push(cap(summarize(mapped), action));
+            } else {
+              results.push(cap(mapped, action));
+            }
           } else if (action.type === 'scroll') {
             await page.evaluate((px) => window.scrollBy(0, px), action.amount || 500);
           } else if (action.type === 'getText') {
-            results.push(await page.innerText(action.selector || 'body'));
+            results.push(cap(await page.innerText(action.selector || 'body'), action));
           } else if (action.type === 'getHtml') {
-            results.push(await page.content());
+            results.push(cap(await page.content(), action));
           } else if (action.type === 'select') {
             await page.selectOption(action.selector, action.value);
           } else if (action.type === 'hover') {
@@ -401,14 +442,6 @@ const apiServer = http.createServer(async (req, res) => {
             await page.goBack({ waitUntil: 'domcontentloaded' });
           } else if (action.type === 'goForward') {
             await page.goForward({ waitUntil: 'domcontentloaded' });
-          } else if (action.type === 'detectCaptcha') {
-            const captchas = await detectCaptchas(page, { timeout: action.timeout || 5000 });
-            const mapped = captchas.map(c => ({
-              ...c,
-              capSolverTask: (() => { try { const { buildCapSolverTask } = require('./captcha-solver'); return buildCapSolverTask(c) || undefined; } catch { return undefined; } })(),
-            }));
-            console.log(`[Captcha] ${summarize(captchas)}`);
-            results.push(mapped);
           } else if (action.type === 'solveCaptcha') {
             // Auto detect + solve + inject in one action
             const apiKey = action.apiKey || CAPSOLVER_KEY;
@@ -464,9 +497,26 @@ const apiServer = http.createServer(async (req, res) => {
               }
             }
           } else if (action.type === 'getCookies') {
-            results.push(await session.context.cookies());
+            results.push(cap(await session.context.cookies(), action));
           } else if (action.type === 'setCookie') {
             await session.context.addCookies([action.cookie]);
+          } else if (action.type === 'upload') {
+            if (!action.selector) throw new Error('upload requires selector');
+
+            const input = action.filePath ?? action.filePaths ?? action.files;
+            if (!input) throw new Error('upload requires filePath (string) or filePaths/files (string[])');
+
+            const files = Array.isArray(input) ? input : [input];
+            const resolved = files.map((p) => (typeof p === 'string' ? p : '')).filter(Boolean);
+            if (resolved.length === 0) throw new Error('upload requires at least one valid file path');
+
+            for (const fp of resolved) {
+              if (!fs.existsSync(fp)) throw new Error(`upload file not found: ${fp}`);
+              const st = fs.statSync(fp);
+              if (!st.isFile()) throw new Error(`upload path is not a file: ${fp}`);
+            }
+
+            await page.setInputFiles(action.selector, resolved);
           }
         } catch (actionErr) {
           results.push({ error: actionErr.message, action: action.type });

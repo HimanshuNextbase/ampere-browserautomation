@@ -11,11 +11,11 @@ description: >
 **Stealth Firefox browser** running as a persistent HTTP API on port 9222.
 Sessions are saved to disk — cookies, logins, and state survive across calls.
 
-- **Bypasses:** Google, Cloudflare bot detection
-- **Persistent sessions:** Sign in once, stay signed in forever
-- **Desktop proxy:** Route traffic through user's residential IP
-- **Actions:** Click, type, scroll, screenshot, extract text/HTML, evaluate JS
-- **Captcha solving:** Auto-detect + solve captchas via CapSolver (Turnstile, reCAPTCHA, hCaptcha, etc.)
+✅ **Bypasses:** Google, Cloudflare bot detection  
+✅ **Persistent sessions:** Sign in once, stay signed in forever  
+✅ **Desktop proxy:** Route traffic through user's residential IP  
+✅ **Actions:** Click, type, scroll, upload files, screenshot, extract text/HTML, evaluate JS
+✅ **Captcha solving:** Auto-detect + solve captchas via CapSolver (Turnstile, reCAPTCHA, hCaptcha, etc.)
 
 ---
 
@@ -109,18 +109,25 @@ Actions execute sequentially after navigation:
 | `wait` | `ms` | `{"type":"wait","ms":2000}` |
 | `waitForSelector` | `selector`, `timeout?` | `{"type":"waitForSelector","selector":".results"}` |
 | `waitForNavigation` | `timeout?` | `{"type":"waitForNavigation"}` |
-| `getText` | `selector?` | `{"type":"getText","selector":".content"}` (default: body) |
-| `getHtml` | -- | `{"type":"getHtml"}` |
+| `getText` | `selector?`, `maxChars?` | `{"type":"getText","selector":".content","maxChars":800}` (default selector: body; default cap: 4000 chars) |
+| `getHtml` | `selector?`, `maxChars?` | `{"type":"getHtml","selector":"#main","maxChars":1200}` (default cap: 4000 chars) |
 | `evaluate` | `script` | `{"type":"evaluate","script":"document.title"}` |
 | `scroll` | `amount?` | `{"type":"scroll","amount":500}` |
 | `select` | `selector`, `value` | `{"type":"select","selector":"#country","value":"US"}` |
 | `hover` | `selector` | `{"type":"hover","selector":".menu"}` |
-| `goBack` | -- | `{"type":"goBack"}` |
-| `goForward` | -- | `{"type":"goForward"}` |
-| `detectCaptcha` | `timeout?` | `{"type":"detectCaptcha"}` -- auto-detect captcha type + sitekey |
-| `solveCaptcha` | `autoSubmit?`, `submitSelector?`, `captchaType?`, `detectTimeout?` | `{"type":"solveCaptcha"}` -- detect + solve + inject token via CapSolver |
-| `getCookies` | -- | `{"type":"getCookies"}` |
+| `goBack` | — | `{"type":"goBack"}` |
+| `goForward` | — | `{"type":"goForward"}` |
+| `getCookies` | — | `{"type":"getCookies"}` |
 | `setCookie` | `cookie` | `{"type":"setCookie","cookie":{"name":"x","value":"y","domain":".example.com"}}` |
+| `upload` | `selector`, `filePath` (or `filePaths`) | `{"type":"upload","selector":"input[type=file]","filePath":"/root/.openclaw/media/inbound/your.jpg"}` |
+| `detectCaptcha` | `timeout?`, `maxRetries?`, `retryDelay?`, `summary?` | `{"type":"detectCaptcha","summary":true}` |
+| `solveCaptcha` | `autoSubmit?`, `submitSelector?`, `captchaType?`, `detectTimeout?` | `{"type":"solveCaptcha"}` -- detect + solve + inject token via CapSolver |
+
+### Output caps (token/payload saver)
+- By default, results are capped server-side to avoid huge responses:
+  - `resultMaxChars` (default: 4000)
+  - `resultMaxItems` (default: 50)
+- Override per action with `maxChars` / `maxItems`.
 
 ### Special URLs
 - `"__close__"` -- Close a session: `{"url":"__close__","sessionId":"gmail"}`
@@ -303,7 +310,18 @@ curl -X POST "http://localhost:9222/?token=$TOKEN" \
 ```bash
 curl -X POST "http://localhost:9222/?token=$TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"url":"__close__","sessionId":"old-session"}'
+  -d '{
+    "url": "https://example.com",
+    "actions": [{"type":"evaluate","script":"document.querySelectorAll(\"a\").length"}],
+    "screenshot": false
+  }'
+```
+
+### Close a session
+```bash
+curl -X POST "http://localhost:9222/?token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"__close__","sessionId":"myapp"}'
 ```
 
 ---
